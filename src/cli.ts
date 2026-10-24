@@ -20,7 +20,8 @@ prepare stops after cleanup and context extraction. chapter continues through tr
 All three execution commands accept --model, --clean-model, --extract-model, --timeout, --api-max-tokens.
 New books: gpt-6-sol@low cleanup, gpt-6-astra@max extraction, gpt-6-astra@low translation.
 No automatic acceptance. No real model calls during init, status or accept.
-Diagnostics contain only stage metadata and application error codes.`;
+Console diagnostics contain stage metadata and application error codes.
+Book-local JSONL sessions contain full requests, backend stdout, replies and timings.`;
 
 const controller = new AbortController();
 const abort = () => {

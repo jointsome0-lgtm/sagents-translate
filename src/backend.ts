@@ -7,11 +7,16 @@ export const CONTRACT = 'sagents-ask/0.4.2';
 export const USAGE_KEYS = ['inputTokens', 'cachedInputTokens', 'writtenInputTokens', 'outputTokens', 'reasoningTokens'] as const;
 export type Usage = Partial<Record<typeof USAGE_KEYS[number], number | null>> | null;
 export type Request = { model: string; system: string; messages: { role: 'user' | 'assistant'; content: string }[]; schema?: object };
-export type Reply = { status: 'done'; text: string; usage?: Usage; endpoint?: string }
-  | { status: 'failed'; reason: string; usage?: Usage };
+export type Diagnostics = { httpStatus?: number; providerCode?: string; param?: string; phase?: 'connect' | 'stream';
+  elapsedMs?: number; pid?: number; stdoutBytes?: number; stderrBytes?: number; firstStdoutMs?: number; lastStdoutMs?: number;
+  backendStatus?: 'done' | 'failed'; backendReason?: string; exitCode?: number | null; exitSignal?: string | null;
+  timeoutSource?: 'backend' | 'adapter_watchdog'; watchdogMs?: number; recordingError?: boolean };
+export type Monitor = { progress?: (diagnostics: Diagnostics) => void; stdout?: (text: string) => void };
+export type Reply = ({ status: 'done'; text: string; usage?: Usage; endpoint?: string }
+  | { status: 'failed'; reason: string; usage?: Usage }) & { diagnostics?: Diagnostics };
 export interface Backend {
   readonly identity: Record<string, unknown>;
-  respond(request: Request, signal?: AbortSignal): Promise<Reply>;
+  respond(request: Request, signal?: AbortSignal, monitor?: Monitor): Promise<Reply>;
 }
 export type BackendConfig = { command: string; args: string[]; structuredOutput: boolean };
 export type ModelOptions = { model: string; timeoutSeconds: number; apiMaxTokens: number | null };
@@ -41,7 +46,12 @@ export function parseReply(text: string, exitCode: number | null): Reply {
   const optional = usage === undefined ? {} : { usage };
   if (value.status === 'failed') {
     ensure(typeof value.reason === 'string' && REASONS.has(value.reason), 'Unknown backend failure.', 'invalid_backend_response');
-    return { status: 'failed', reason: value.reason, ...optional };
+    const diagnostics: Diagnostics = {};
+    if (integer(value.httpStatus, 100, 599)) diagnostics.httpStatus = value.httpStatus;
+    if (typeof value.providerCode === 'string' && /^[a-z][a-z0-9_.-]{0,79}$/.test(value.providerCode)) diagnostics.providerCode = value.providerCode;
+    if (typeof value.param === 'string' && /^[a-z_][a-z0-9_.[\]-]{0,79}$/.test(value.param)) diagnostics.param = value.param;
+    if (value.stage === 'connect' || value.stage === 'stream') diagnostics.phase = value.stage;
+    return { status: 'failed', reason: value.reason, ...optional, diagnostics };
   }
   ensure(value.status === 'done' && filled(value.text) && exitCode === 0, 'Invalid or incomplete backend result.', 'invalid_backend_response');
   const endpoint = typeof value.endpoint === 'string' && /^[A-Za-z0-9 ./_-]{1,40}$/.test(value.endpoint) ? value.endpoint : undefined;
@@ -79,16 +89,28 @@ export function createSagentsBackend(config: BackendConfig, options: ModelOption
     structuredOutput: config.structuredOutput, model: options.model, timeoutSeconds: options.timeoutSeconds, apiSettings };
   return {
     identity,
-    async respond(request, signal) {
+    async respond(request, signal, monitor) {
       if (signal?.aborted) return { status: 'failed', reason: 'cancelled' };
       const body = JSON.stringify(request);
       if (Buffer.byteLength(body) > MAX_BYTES) return { status: 'failed', reason: 'request_limit' };
       return new Promise<Reply>(resolveReply => {
+        const started = performance.now(), watchdogMs = (options.timeoutSeconds + 125) * 1000;
         const child = spawn(command, [...config.args, 'ask', '--timeout', String(options.timeoutSeconds)], {
           shell: false, env, stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32',
         });
         const chunks: Buffer[] = [];
-        let size = 0, stopped: string | undefined, force: NodeJS.Timeout | undefined;
+        let size = 0, stderrBytes = 0, firstStdoutMs: number | undefined, lastStdoutMs: number | undefined;
+        let stopped: string | undefined, force: NodeJS.Timeout | undefined, observed: Reply | undefined, recordingError = false;
+        const decoder = new TextDecoder('utf-8');
+        const elapsed = () => Math.round(performance.now() - started);
+        const diagnostics = (): Diagnostics => ({ ...observed?.diagnostics, elapsedMs: elapsed(),
+          ...(child.pid === undefined ? {} : { pid: child.pid }), stdoutBytes: size, stderrBytes, watchdogMs,
+          ...(firstStdoutMs === undefined ? {} : { firstStdoutMs }), ...(lastStdoutMs === undefined ? {} : { lastStdoutMs }),
+          ...(recordingError ? { recordingError: true } : {}),
+          ...(observed ? { backendStatus: observed.status, ...(observed.status === 'failed' ? { backendReason: observed.reason } : {}) } : {}) });
+        // Observation must not interrupt a generation or credential renewal. Final checkpoint writes still surface I/O errors.
+        const report = () => { try { monitor?.progress?.(diagnostics()); } catch { recordingError = true; } };
+        const recordOutput = (text: string) => { if (text) { try { monitor?.stdout?.(text); } catch { recordingError = true; } } };
         const terminate = (signal: NodeJS.Signals) => {
           try {
             if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
@@ -103,23 +125,42 @@ export function createSagentsBackend(config: BackendConfig, options: ModelOption
         // ask has no cooperative cancellation input. Let it settle after Ctrl+C,
         // including credential renewal; the workflow will make no following call.
         // sagents may finish token renewal up to 120 s after its own timeout.
-        const timer = setTimeout(() => stop('timeout'), (options.timeoutSeconds + 125) * 1000);
+        const timer = setTimeout(() => stop('timeout'), watchdogMs);
+        const heartbeat = setInterval(report, 30_000);
+        child.on('spawn', report);
         child.stdout.on('data', (chunk: Buffer) => {
+          const first = firstStdoutMs === undefined;
+          firstStdoutMs ??= elapsed(); lastStdoutMs = elapsed();
           size += chunk.length;
           if (size > MAX_BYTES) stop('invalid_backend_response');
-          else chunks.push(chunk);
+          else {
+            chunks.push(chunk);
+            recordOutput(decoder.decode(chunk, { stream: true }));
+            // A complete JSON response is useful diagnostic evidence even if the process later fails to exit.
+            try { observed = parseReply(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)), 0); }
+            catch { observed = undefined; }
+          }
+          if (first || observed) report();
         });
         // stderr can contain provider text or secrets: drain, never persist or print it.
-        child.stderr.resume();
+        child.stderr.on('data', (chunk: Buffer) => { stderrBytes += chunk.length; });
         child.stdin.on('error', () => { /* close/exit determines whether stdout is usable */ });
         child.on('error', () => { stopped ??= 'backend_start_failed'; });
-        child.on('close', code => {
-          clearTimeout(timer); if (force) clearTimeout(force);
-          if (stopped) { resolveReply({ status: 'failed', reason: stopped }); return; }
+        child.on('close', (code, exitSignal) => {
+          clearTimeout(timer); clearInterval(heartbeat); if (force) clearTimeout(force);
+          recordOutput(decoder.decode());
+          const details: Diagnostics = { ...diagnostics(), exitCode: code, exitSignal,
+            ...(stopped === 'timeout' ? { timeoutSource: 'adapter_watchdog' } : {}) };
+          if (stopped) {
+            resolveReply({ status: 'failed', reason: stopped, diagnostics: details,
+              ...(observed?.usage !== undefined ? { usage: observed.usage } : {}) }); return;
+          }
           try {
             const text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
-            resolveReply(parseReply(text, code));
-          } catch { resolveReply({ status: 'failed', reason: 'invalid_backend_response' }); }
+            const reply = parseReply(text, code);
+            resolveReply({ ...reply, diagnostics: { ...details, ...reply.diagnostics,
+              ...(reply.status === 'failed' && reply.reason === 'timeout' ? { timeoutSource: 'backend' } : {}) } });
+          } catch { resolveReply({ status: 'failed', reason: 'invalid_backend_response', diagnostics: details }); }
         });
         child.stdin.end(body);
       });

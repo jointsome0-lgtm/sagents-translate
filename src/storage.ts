@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { AppError, errno, parseJSON } from './core.ts';
@@ -20,6 +20,8 @@ export function atomicWrite(path: string, content: string): void {
 }
 
 export const writeJSON = (path: string, value: unknown): void => atomicWrite(path, `${JSON.stringify(value, null, 2)}\n`);
+// The first line is created with atomicWrite; later records remain readable after a crash (ignore an unfinished final line).
+export const appendJSON = (path: string, value: unknown): void => appendFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600, flush: true });
 
 export function readText(path: string): string {
   try { return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(readFileSync(path)); }

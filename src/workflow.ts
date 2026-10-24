@@ -1,16 +1,16 @@
 import { existsSync, mkdirSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createSagentsBackend, requestHash, usageSummary } from './backend.ts';
-import type { Backend, BackendConfig, ModelOptions, Request, Usage } from './backend.ts';
+import type { Backend, BackendConfig, Diagnostics, ModelOptions, Request, Usage } from './backend.ts';
 import { materialFor, readBook, validModel, WORKFLOW } from './book.ts';
 import type { Material } from './book.ts';
 import { AppError, chapterName, digest, ensure, hash, integer, now, object, parseJSON } from './core.ts';
 import { applyCleaning, schemaFor, sourceUnits, splitUnits, STAGES, validateOutput } from './outputs.ts';
 import type { Cleaning, Extraction, Issue, Output, Review, Stage, Translation, Unit } from './outputs.ts';
-import { atomicWrite, readJSON, readText, withBookLock, writeJSON } from './storage.ts';
+import { appendJSON, atomicWrite, readJSON, readText, withBookLock, writeJSON } from './storage.ts';
 
 type Attempt = { stage: Stage; startedAt: string; finishedAt?: string; requestHash: string;
-  outcome: 'pending' | 'done' | 'failed' | 'interrupted'; reason?: string; usage?: Usage; endpoint?: string };
+  outcome: 'pending' | 'done' | 'failed' | 'interrupted'; reason?: string; usage?: Usage; endpoint?: string; diagnostics?: Diagnostics; session?: string };
 type Checkpoint = { completedAt: string; output: Output; outputHash: string };
 type Part = { id: string; units: Unit[]; stages: Partial<Record<Stage, Checkpoint>>; attempts: Attempt[];
   children?: [string, string]; splitReason?: string };
@@ -188,12 +188,25 @@ async function executeParts(root: string, run: Run, parts: Part[], stages: reado
         if (options.signal?.aborted) stopped(root, run, 'cancelled');
         unchanged();
         const request = requestFor(run, part, stage, structuredOutput);
-        const attempt: Attempt = { stage, startedAt: now(), requestHash: requestHash(request), outcome: 'pending' };
+        const attempt: Attempt = { stage, startedAt: now(), requestHash: requestHash(request), outcome: 'pending',
+          session: `sessions/${stage}-${part.id}-${part.attempts.length + 1}.jsonl` };
+        const session = join(runDirectory(root, run.inputs.chapter, run.version), attempt.session!);
+        atomicWrite(session, `${JSON.stringify({ schemaVersion: 1, type: 'request', at: attempt.startedAt,
+          version: run.version, chapter: run.inputs.chapter, part: part.id, stage, request })}\n`);
+        const record = (type: string, data: object) => appendJSON(session, { type, at: now(), ...data });
         part.attempts.push(attempt); save(root, run);
-        options.progress?.({ version: run.version, part: part.id, stage, state: 'started' });
+        options.progress?.({ version: run.version, part: part.id, stage, model: request.model, state: 'started', session });
         let reason: string | undefined;
         try {
-          const reply = await backend.respond(request, options.signal);
+          const reply = await backend.respond(request, options.signal, {
+            progress: diagnostics => {
+              attempt.diagnostics = diagnostics; record('progress', { diagnostics }); save(root, run);
+              options.progress?.({ version: run.version, part: part.id, stage, model: request.model, state: 'waiting', diagnostics });
+            },
+            stdout: text => record('backend_stdout', { text }),
+          });
+          record('backend_reply', { reply });
+          if (reply.diagnostics) attempt.diagnostics = reply.diagnostics;
           if (reply.usage !== undefined) attempt.usage = reply.usage;
           if (reply.status === 'failed') reason = reply.reason;
           else {
@@ -201,11 +214,16 @@ async function executeParts(root: string, run: Run, parts: Part[], stages: reado
             const output = validateOutput(parseJSON(reply.text, 'Invalid model JSON.', 'invalid_model_output'), stage, part.units);
             part.stages[stage] = { completedAt: now(), output, outputHash: digest(output) };
           }
-        } catch (error) { reason = error instanceof AppError ? error.code : 'backend_error'; }
+        } catch (error) {
+          reason = error instanceof AppError ? error.code : 'backend_error';
+          record('error', { reason, ...(error instanceof AppError ? { message: error.message } : {}) });
+        }
         attempt.finishedAt = now(); attempt.outcome = reason ? 'failed' : 'done';
         if (reason) attempt.reason = reason;
         save(root, run);
-        options.progress?.({ version: run.version, part: part.id, stage, state: reason ? 'failed' : 'done', ...(reason ? { reason } : {}) });
+        record('finished', { outcome: attempt.outcome, reason, usage: attempt.usage, diagnostics: attempt.diagnostics });
+        options.progress?.({ version: run.version, part: part.id, stage, model: request.model, state: reason ? 'failed' : 'done',
+          ...(reason ? { reason } : {}), ...(attempt.diagnostics ? { diagnostics: attempt.diagnostics } : {}) });
         if (!reason) break;
         if (options.signal?.aborted) stopped(root, run, 'cancelled');
         if (LIMITS.has(reason)) {
@@ -328,6 +346,8 @@ export async function acceptVersion(root: string, number: number, version: strin
 
 export function runSummary(root: string, run: Run) {
   const path = runDirectory(root, run.inputs.chapter, run.version);
+  const latestAttempt = allParts(run).flatMap(p => p.attempts.map(a => ({ part: p.id, ...a })))
+    .sort((a, b) => a.startedAt.localeCompare(b.startedAt)).at(-1);
   return { version: run.version, state: run.state, kind: run.inputs.kind, fingerprint: run.fingerprint,
     sourceHash: run.inputs.material.sourceHash, parts: leaves(run).length,
     completedStages: [...leaves(run), ...partLeaves(run.preparation?.clean ?? []), ...partLeaves(run.preparation?.extract ?? [])]
@@ -336,6 +356,7 @@ export function runSummary(root: string, run: Run) {
       cleanedSource: join(path, 'cleaned.txt'), cleanup: join(path, 'cleanup.json'), extraction: join(path, 'extraction.json'),
       reusedPreparation: run.preparation.reused ?? {} } : {}),
     ...(run.stopReason ? { stopReason: run.stopReason } : {}),
+    ...(latestAttempt ? { latestAttempt: { ...latestAttempt, ...(latestAttempt.session ? { session: join(path, latestAttempt.session) } : {}) } } : {}),
     ...(run.state === 'complete' ? { translation: join(runDirectory(root, run.inputs.chapter, run.version), 'translation.md'), remainingIssues: remainingIssues(run).length } : {}),
     usage: usageSummary(allParts(run).flatMap(p => p.attempts)) };
 }

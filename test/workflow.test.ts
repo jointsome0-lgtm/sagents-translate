@@ -94,15 +94,23 @@ test('truncated backend JSON and missing source coverage cannot complete a stage
     assert.match(error, /invalid_backend_response|invalid_model_output/); assert.ok(!error.includes('PRIVATE_PROVIDER_SECRET'));
     const report = await f.run(['status', f.root]);
     assert.equal(report.chapters[0].versions[0].completedStages, 0);
+    const session = read(report.chapters[0].versions[0].latestAttempt.session);
+    const events = session.trim().split('\n').map(s => JSON.parse(s));
+    assert.ok(events.some(e => e.type === 'request' && e.request.system && e.request.messages[0].content.includes('小林')));
+    assert.ok(events.some(e => e.type === 'backend_stdout' && e.text)); assert.ok(!session.includes('PRIVATE_PROVIDER_SECRET'));
     write(f.control, {}); assert.equal((await f.run()).version, 'v0001');
   }
 });
 
 test('budget exhaustion stops immediately despite retries, keeps progress, and leaves unknown usage unknown', async t => {
-  const f = setup(t, { mode: 'budget', stage: 'extract', omitUsage: true });
+  const f = setup(t, { mode: 'budget', stage: 'extract', omitUsage: true,
+    diagnostics: { httpStatus: 402, providerCode: 'insufficient_quota', param: 'model', stage: 'connect' } });
   f.book.settings.retries = 2; write(join(f.root, 'book.json'), f.book);
   assert.match(await f.run(f.args, 3), /budget_exceeded/);
   assert.equal(f.calls().filter(c => c.stage === 'extract').length, 1); assert.ok(!f.calls().some(c => c.stage === 'draft'));
+  const failure = (await f.run(['status', f.root])).chapters[0].versions[0].latestAttempt.diagnostics;
+  assert.equal(failure.httpStatus, 402); assert.equal(failure.providerCode, 'insufficient_quota');
+  assert.equal(failure.param, 'model'); assert.equal(failure.phase, 'connect'); assert.equal(failure.exitCode, 1);
   write(f.control, { omitUsage: true }); const result = await f.run();
   assert.equal(result.version, 'v0001'); assert.equal(f.calls().filter(c => c.stage === 'draft').length, 1);
   assert.equal(result.usage.inputTokens.knownTotal, null); assert.equal(result.usage.inputTokens.unknownCalls, f.calls().length);

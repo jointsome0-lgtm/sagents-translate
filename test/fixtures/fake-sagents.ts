@@ -12,7 +12,7 @@ appendFileSync(`${controlPath}.calls`, `${JSON.stringify({ stage: data.stage, pa
   units: data.sourceUnits.length, schema: !!request.schema, apiMaxTokens: process.env.SAGENTS_API_MAX_TOKENS ?? null,
   model: request.model })}\n`);
 const send = (value: unknown, code = 0) => { console.log(JSON.stringify(value)); process.exitCode = code; };
-const fail = (reason: string) => send({ status: 'failed', reason }, 1);
+const fail = (reason: string) => send({ status: 'failed', reason, ...(control.diagnostics ?? {}) }, 1);
 
 if (process.argv[3] !== 'ask' || process.argv[4] !== '--timeout') fail('invalid_request');
 else if (control.forbid?.some((s: string) => JSON.stringify(request).includes(s))) fail('invalid_request');
