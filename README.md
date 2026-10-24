@@ -1,37 +1,102 @@
 # sagents-translate
 
-A chapter-by-chapter literary translation tool with a persistent glossary, editorial history, and resumable stages.
+Локальный CLI для литературного перевода по главам: черновик → сверка с оригиналом → редактура → итоговая сверка. Каждый этап сохраняется; повторный запуск продолжает незавершённую версию. Принятие перевода — отдельное действие пользователя.
 
-## Status
+Первый сценарий — китайский текст 木葉手記 → русский с главы 1. Имена, техники, канон и правила конкретной книги задаются в материалах проекта. В коде и шаблонах нет привязки к произведению или вселенной.
 
-Project bootstrap. This repository records the initial design; the translation commands are not implemented yet.
+## Запуск
 
-## Architecture
+Нужен **Node.js 24.9+**. Зависимостей времени выполнения нет; TypeScript и типы Node нужны только для проверки разработки. MVP проверен на Linux с локальной файловой системой.
 
-The translator is a separate application. Its first model adapter will use the documented JSON interface of [`sagents ask`](https://github.com/jointsome0-lgtm/sagents/blob/main/docs/ask.md). sagents owns sign-in, token renewal, provider connections, and transport errors. The translator owns the book and the translation workflow.
+```sh
+npm ci
+npm run check
+npm test
 
-Keep the adapter isolated so another model backend can be added without changing the book format. Record the supported sagents version and validate request and response shapes.
+# Полностью локальный пример, без провайдера и оплаты.
+# Каталог назначения должен быть новым.
+node examples/offline-demo.ts ./books/demo
+node src/cli.ts status ./books/demo
+```
 
-## Workflow
+Пример использует два синтетических абзаца и подставной backend. Он создаёт принятую `v0001` и новую, ещё не принятую редакцию `v0002`. Это проверка работы инструмента, не оценка качества модели. Результаты находятся в `books/demo/chapters/0001/versions/`.
 
-1. Prepare the chapter and its relevant glossary, story state, and character knowledge.
-2. Draft the translation.
-3. Compare it with the original for omissions, additions, numbers, terminology, and meaning.
-4. Edit the target-language prose, then recheck substantive changes.
-5. Save a new revision and proposed updates to the shared glossary and story notes.
-6. Review consistency across a block of chapters and revisit affected earlier passages when new evidence warrants it.
+Для настоящей книги отдельно установите и настройте [sagents](https://github.com/jointsome0-lgtm/sagents). Его авторизация, ключи, подключения и ограничения остаются в sagents. Переводчик не читает его файлы credentials и не реализует вход.
 
-Read ahead for context without introducing later revelations into earlier narration. Keep source problems and uncertain interpretations in an editorial issue log.
+Подготовьте UTF-8 файлы `001.txt`, `002-title.md`, … в каталоге исходников; один файл — одна глава. Подкаталоги и симлинки не импортируются. Пример с доступным в вашем подключении идентификатором модели вместо `<id>`:
 
-Each saved stage should identify its source, model, workflow version, and glossary revision. Resume from completed stages after a failure; preserve accepted translations when producing a revision. Stop on exhausted provider budgets.
+```sh
+node src/cli.ts init ./books/muye-shouji --source ./books/chapters --from zh --to ru
+node src/cli.ts chapter ./books/muye-shouji --number 1 --model '<id>'
+node src/cli.ts status ./books/muye-shouji
 
-Choose output settings according to the model and provider. There is no universal 2048-token ceiling: translate a whole chapter when the input, context, and expected output fit, and split at meaningful boundaries when necessary.
+# Сначала прочитайте translation.md и remaining-issues.json указанной версии.
+node src/cli.ts accept ./books/muye-shouji --number 1 --version v0001
 
-## Initial milestones
+# Замечания храните вместе с книгой.
+node src/cli.ts revise ./books/muye-shouji --number 1 --notes ./books/muye-shouji/feedback.md
+node src/cli.ts accept ./books/muye-shouji --number 1 --version v0002
+```
 
-- Implement the sagents adapter with synthetic fixtures and no live calls in tests.
-- Define a versioned book format and reliable stage checkpoints.
-- Build a single-chapter draft, review, and revision cycle.
-- Add glossary proposals, block consistency checks, and export.
+`init` **копирует** исходники в `book/sources/`. После импорта редактируйте эти копии: изменения внешнего каталога автоматически не подхватываются. Запуск `chapter` с теми же входными данными продолжает прежнюю версию, а после изменения исходника, выбранного контекста, правил или настроек модели создаёт следующую. Уже сохранённые версии остаются на месте.
 
-Book sources, translations, and run data belong in a local `books/` directory and are excluded from Git by default. Credentials remain outside this repository.
+Можно выполнить `npm link` из checkout и использовать `sagents-translate` вместо `node src/cli.ts`. Это запуск из связанного checkout, без сборки. Публикация npm-пакета с компилированным JavaScript в MVP не предусмотрена.
+
+## Команды и настройки
+
+| Команда | Действие |
+| --- | --- |
+| `init <book> --source <dir> --from zh --to ru` | Создать проект, скопировать главы и редактируемые шаблоны |
+| `chapter <book> --number 1 --model <id>` | Создать или продолжить цикл главы |
+| `revise <book> --number 1 --notes <file>` | Новая версия с учётом замечаний; тот же четырёхэтапный цикл |
+| `accept <book> --number 1 --version v0002` | Явно принять завершённую актуальную версию |
+| `status <book>` | JSON со всеми версиями, прогрессом, принятым текстом, устареванием материалов и usage |
+
+`revise` берёт принятую версию, а если её нет — последнюю завершённую версию `chapter`. `--base v0002` выбирает другую завершённую основу. Без `--model` редакция использует модель основы. Повторение тех же замечаний с той же основой возобновляет ту же редакцию. После принятия новой основы те же замечания означают уже новую редакцию. Если исходник изменился относительно основы, сначала выполните `chapter`.
+
+`chapter` и `revise` принимают `--timeout <1..3600 секунд>` и `--api-max-tokens <n>`. Остальные настройки находятся в `book.json`:
+
+```json
+{
+  "backend": { "command": "sagents", "args": [], "structuredOutput": true },
+  "settings": {
+    "model": null,
+    "timeoutSeconds": 600,
+    "apiMaxTokens": null,
+    "retries": 0,
+    "maxParts": 8
+  }
+}
+```
+
+Это фрагмент файла, не замена всего `book.json`. `model: null` требует `--model` для первого запуска. `retries` — 0–2 дополнительных повтора неудачного этапа за один запуск CLI; по умолчанию повторов нет. Невалидный ответ никогда не становится готовым этапом. `budget_exceeded` останавливает работу сразу, даже если повторы разрешены. После устранения причины повторите ту же команду. Сохранённые этапы не вызываются заново.
+
+Адаптер запускает исполняемый файл с массивом аргументов, **без shell**, и передаёт весь JSON через stdin. `backend.args` — только постоянные аргументы запуска, например абсолютный путь к локальному CLI при `command: "node"`. Не размещайте там ключи, credentials или тексты книги. При `structuredOutput: false` JSON Schema остаётся в инструкциях, но поле `schema` не отправляется в sagents; локальная проверка ответа сохраняется. Это ручная настройка для сервера без поддержки strict JSON Schema.
+
+Для `api:<id>` поддерживается `--api-max-tokens`, который устанавливает `SAGENTS_API_MAX_TOKENS` только дочернему процессу. Если его нет и `settings.apiMaxTokens` равен `null`, используется окружение sagents. **2048 — изменяемый дефолт только API-подключения sagents 0.4.2**, а не общий предел переводчика. Для остальных моделей параметр не посылается и попытка задать `--api-max-tokens` отклоняется. Усилие рассуждения передаётся в идентификаторе модели ровно по [контракту sagents](docs/backend.md).
+
+Глава сначала переводится целиком. Только фактический `context_limit`, `output_limit` или превышение документированного размера запроса sagents запускает разбиение: сначала между абзацами, затем между предложениями. Затронутая часть проходит свой цикл заново; старые этапы остаются в истории. Максимум `maxParts` частей (1–64, по умолчанию 8), после чего инструмент останавливается. Если ограничение вызвано большим общим контекстом или длинным неделимым предложением, нужно уменьшить контекст или изменить поддерживаемые настройки backend. Выдуманных оценок токенизации и автоматического переключения модели нет.
+
+## Контекст и редакционная история
+
+В `context/glossary.json` хранятся **принятые** написания имён и терминов. В `context/notes.json` — стиль, обращения, состояние сюжета, знания и предположения персонажей, переводческие трактовки, вопросы, возможные ошибки оригинала и замечания пользователя. Формат и примеры: [формат книги](docs/book-format.md).
+
+У каждой записи есть `fromChapter` и `toChapter`: сведения из будущих глав отсекаются до составления запроса. Глоссарий выбирается по исходному термину/алиасам; заметки — по `match`, пустой список означает общую заметку. Это прозрачный поиск подстрок, без embeddings. Правильную временную разметку задаёт пользователь. Знание, полученное в конце главы N, обычно доступно лишь с N+1; внутри одной главы временной разметки пока нет.
+
+Промпты находятся в `prompts/*.md`, их версия — в `prompts/manifest.json`. Они копируются в книгу при `init`; обновление инструмента не меняет их автоматически. Хеш учитывает и текст файлов, поэтому правка без повышения номера версии тоже создаст новый результат.
+
+`proposals.json` содержит предложения модели об изменении глоссария и заметок с указанием этапа и части. Ни завершение цикла, ни `accept` не переносят их в принятый контекст. Пользователь проверяет их и вручную переносит нужное в `context/`, выставляя главу доступности. `remaining-issues.json` содержит замечания итоговой сверки; версия может быть завершена с такими замечаниями. Решение о принятии остаётся явным.
+
+## Надёжность и границы MVP
+
+Все исходники, снимки контекста, результаты этапов, попытки и редакции находятся в проекте книги. `books/` исключён из Git; каждый созданный проект также получает собственный `.gitignore`. Диагностика содержит коды ошибок и номера этапов; stderr backend не печатается и не сохраняется. Тексты запросов не записываются в диагностические логи. Снимки материалов в `run.json` нужны для воспроизводимости и являются данными книги.
+
+Запись использует временный файл, `fsync`, атомарный `rename` и блокировку проекта через встроенный `node:sqlite`. После аварии ОС освобождает блокировку; удалять `.write-lock.sqlite` нельзя. Один писатель на книгу; `status` читает уже зафиксированные снимки. Контрольная сумма не позволяет незаметно продолжить повреждённый checkpoint. На Node 24.9 предупреждение об экспериментальном SQLite ожидаемо. Каталоги NFS/облачной синхронизации и Windows не проверены.
+
+`Ctrl+C`/`SIGTERM` прекращают дальнейшие этапы, но дают текущему `sagents ask` закончиться: его обновление credentials нельзя безопасно прервать через существующий CLI. Внешний watchdog ждёт timeout sagents плюс 125 секунд на обновление авторизации; затем завершает зависший процесс. `SIGKILL` сохраняет уже завершённые этапы, но ответ, ещё не записанный на диск, может потеряться. При возобновлении такой вызов выполняется повторно: ровно однократная оплата не гарантируется.
+
+Usage сохраняется только в сообщённых полях, в том числе при структурно неправильном тексте модели. `knownTotal` — сумма известных значений, `unknownCalls` — попытки без соответствующего счётчика; при отсутствии данных сумма равна `null`. Включённые в input/output кешированные и reasoning токены не прибавляются к ним повторно. Стоимость не оценивается. Коды выхода: `0` — успех, `1` — ошибка, `3` — исчерпан бюджет, `4` — конфликт записи, `130` — отмена.
+
+В репозитории шесть сценарных проверок через CLI: сохранность принятого текста и смена исходника; возобновление; плохие ответы; бюджет; конфликт/аварийное завершение; разбиение по реальному ограничению. Проверяются также фильтрация поздних сведений и отсутствие выдуманного usage. Правила минимального тестового набора закреплены в [AGENTS.md](AGENTS.md). **Реальных модельных вызовов при разработке MVP не было**; литературное качество и поведение конкретного провайдера ещё требуют проверки пользователем.
+
+Проверка схемы и наличия всех абзацев не доказывает смысловую полноту перевода. После разбиения сверки выполняются по частям; отдельной общей сверки стыков пока нет. Модель может ошибаться и в переводе, и в критике. UI, загрузчики сайтов, автоматический перевод всей книги, согласование блока глав, экспорт в EPUB/DOCX, автоматическое принятие контекста и автоматическая миграция схем остаются за пределами MVP.

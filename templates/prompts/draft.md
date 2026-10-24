@@ -1,0 +1,1 @@
+Translate the entire supplied source into the target language. If baseTranslation and userFeedback are present, produce a new revision of that text, using the feedback while preserving the source's meaning. Resolve requests that contradict the original in a separate note rather than silently altering the story. Return segments, glossaryProposals and notes.
