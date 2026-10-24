@@ -14,6 +14,7 @@ try {
   book.backend.command = process.execPath;
   book.backend.args = [fileURLToPath(new URL('../test/fixtures/fake-sagents.ts', import.meta.url)), control];
   book.settings.model = 'fixture-model';
+  book.settings.cleanModel = 'fixture-clean'; book.settings.extractModel = 'fixture-extract';
   writeJSON(join(root, 'book.json'), book);
   const first = await runChapter(root, { number: 1 });
   await acceptVersion(root, 1, first.version);

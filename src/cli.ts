@@ -6,6 +6,7 @@ import { AppError, ensure, integer } from './core.ts';
 import { acceptVersion, runChapter, runSummary, status } from './workflow.ts';
 
 const HELP = `sagents-translate init <book> --source <chapters> --from <language> --to <language>
+sagents-translate prepare <book> --number <n> [--clean-model <id>] [--extract-model <id>]
 sagents-translate chapter <book> --number <n> [--model <id>] [--timeout <seconds>] [--api-max-tokens <n>]
 sagents-translate revise <book> --number <n> --notes <feedback.md> [--base <version>] [--model <id>]
                          [--timeout <seconds>] [--api-max-tokens <n>]
@@ -15,6 +16,9 @@ sagents-translate status <book>
 Node.js >=24.9.0. Without installation: node src/cli.ts <command> ...
 Sources: numbered UTF-8 .txt/.md files, e.g. 001-title.txt. init copies them into the book.
 Book-local JSON settings, context and versioned prompt files are editable.
+prepare stops after cleanup and context extraction. chapter continues through translation.
+All three execution commands accept --model, --clean-model, --extract-model, --timeout, --api-max-tokens.
+New books: gpt-6-sol@low cleanup, gpt-6-astra@max extraction, gpt-6-astra@low translation.
 No automatic acceptance. No real model calls during init, status or accept.
 Diagnostics contain only stage metadata and application error codes.`;
 
@@ -28,9 +32,10 @@ try {
   const [command, ...args] = process.argv.slice(2);
   if (!command || ['help', '--help', '-h'].includes(command)) console.log(HELP);
   else {
+    const execution = ['number', 'model', 'clean-model', 'extract-model', 'timeout', 'api-max-tokens'];
     const allowed: Record<string, string[]> = {
-      init: ['source', 'from', 'to'], chapter: ['number', 'model', 'timeout', 'api-max-tokens'],
-      revise: ['number', 'notes', 'base', 'model', 'timeout', 'api-max-tokens'], accept: ['number', 'version'], status: [],
+      init: ['source', 'from', 'to'], chapter: execution, prepare: execution,
+      revise: [...execution, 'notes', 'base'], accept: ['number', 'version'], status: [],
     };
     ensure(command in allowed, 'Unknown command. Run --help.', 'invalid_options');
     let parsed: ReturnType<typeof parseArgs>;
@@ -51,6 +56,7 @@ try {
     else if (command === 'accept') console.log(JSON.stringify(await acceptVersion(root, positive('number'), required('version')), null, 2));
     else {
       const run = await runChapter(root, { number: positive('number'), model: values.model,
+        cleanModel: values['clean-model'], extractModel: values['extract-model'], prepareOnly: command === 'prepare',
         ...(command === 'revise' ? { notes: resolve(required('notes')), base: values.base } : {}),
         ...(values.timeout ? { timeoutSeconds: positive('timeout') } : {}),
         ...(values['api-max-tokens'] ? { apiMaxTokens: positive('api-max-tokens') } : {}),

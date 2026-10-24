@@ -4,15 +4,15 @@ import { fileURLToPath } from 'node:url';
 import type { BackendConfig } from './backend.ts';
 import { AppError, chapterName, digest, ensure, filled, hash, integer, object } from './core.ts';
 import { atomicWrite, readJSON, readText, syncDirectory, writeJSON } from './storage.ts';
-import { STAGES, sourceUnits } from './outputs.ts';
+import { ALL_STAGES, sourceUnits } from './outputs.ts';
 import type { Stage } from './outputs.ts';
 
-export const WORKFLOW = 'chapter/1';
+export const WORKFLOW = 'chapter/2';
 export type Book = {
   schemaVersion: 1; from: string; to: string;
   chapters: { number: number; file: string }[];
   backend: BackendConfig;
-  settings: { model: string | null; timeoutSeconds: number; apiMaxTokens: number | null; retries: number; maxParts: number };
+  settings: { model: string | null; cleanModel?: string; extractModel?: string; timeoutSeconds: number; apiMaxTokens: number | null; retries: number; maxParts: number };
 };
 type Scope = { id: string; fromChapter: number; toChapter: number | null };
 export type GlossaryEntry = Scope & { source: string; target: string; aliases: string[]; notes: string };
@@ -39,6 +39,7 @@ export function readBook(root: string): Book {
     && typeof b.structuredOutput === 'boolean', 'Invalid backend configuration.');
   ensure(object(s) && (s.model === null || validModel(s.model)) && integer(s.timeoutSeconds, 1, 3600)
     && (s.apiMaxTokens === null || integer(s.apiMaxTokens, 1)) && integer(s.retries, 0, 2) && integer(s.maxParts, 1, 64), 'Invalid execution settings.');
+  ensure(['cleanModel', 'extractModel'].every(k => s[k] === undefined || validModel(s[k])), 'Invalid preparation model.');
   return v as unknown as Book;
 }
 
@@ -73,7 +74,13 @@ export function readPrompts(root: string): Prompts {
   const manifest = readJSON(join(root, 'prompts', 'manifest.json'));
   ensure(object(manifest) && manifest.schemaVersion === 1 && filled(manifest.version), 'Invalid prompt manifest.');
   const rules = readText(join(root, 'prompts', 'rules.md'));
-  const stages = Object.fromEntries(STAGES.map(stage => [stage, readText(join(root, 'prompts', `${stage}.md`))])) as Record<Stage, string>;
+  const stages = Object.fromEntries(ALL_STAGES.map(stage => {
+    const local = join(root, 'prompts', `${stage}.md`);
+    // Existing books keep their editable translation prompts; only new preparation files have a fallback.
+    const path = !existsSync(local) && (stage === 'clean' || stage === 'extract')
+      ? fileURLToPath(new URL(`../templates/prompts/${stage}.md`, import.meta.url)) : local;
+    return [stage, readText(path)];
+  })) as Record<Stage, string>;
   ensure(filled(rules) && Object.values(stages).every(filled), 'Prompt files must not be empty.');
   return { version: manifest.version, rules, stages };
 }
@@ -108,7 +115,8 @@ export function initBook(rootPath: string, sourcePath: string, from: string, to:
   chapters.sort((a, b) => a.number - b.number);
   const book: Book = { schemaVersion: 1, from, to, chapters,
     backend: { command: 'sagents', args: [], structuredOutput: true },
-    settings: { model: null, timeoutSeconds: 600, apiMaxTokens: null, retries: 0, maxParts: 8 } };
+    settings: { model: 'gpt-6-astra@low', cleanModel: 'gpt-6-sol@low', extractModel: 'gpt-6-astra@max',
+      timeoutSeconds: 600, apiMaxTokens: null, retries: 0, maxParts: 8 } };
   mkdirSync(dirname(root), { recursive: true, mode: 0o700 });
   const temporary = mkdtempSync(join(dirname(root), '.sagents-translate-init-'));
   try {
@@ -117,7 +125,7 @@ export function initBook(rootPath: string, sourcePath: string, from: string, to:
     writeJSON(join(temporary, 'context', 'glossary.json'), { schemaVersion: 1, version: '1', entries: [] });
     writeJSON(join(temporary, 'context', 'notes.json'), { schemaVersion: 1, version: '1', entries: [] });
     const templates = fileURLToPath(new URL('../templates/prompts/', import.meta.url));
-    for (const file of ['manifest.json', 'rules.md', ...STAGES.map(s => `${s}.md`)]) atomicWrite(join(temporary, 'prompts', file), readText(join(templates, file)));
+    for (const file of ['manifest.json', 'rules.md', ...ALL_STAGES.map(s => `${s}.md`)]) atomicWrite(join(temporary, 'prompts', file), readText(join(templates, file)));
     writeJSON(join(temporary, 'book.json'), book);
     // Each competing init renames a fully populated directory. Neither can replace the other.
     renameSync(temporary, root); syncDirectory(dirname(root));

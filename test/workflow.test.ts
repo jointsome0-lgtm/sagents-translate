@@ -33,8 +33,9 @@ function setup(t: TestContext, mode: Record<string, unknown> = {}) {
   const book = json(join(root, 'book.json'));
   book.backend = { command: process.execPath, args: [fixture, control], structuredOutput: true };
   book.settings.model = 'fixture-model';
+  book.settings.cleanModel = 'fixture-clean'; book.settings.extractModel = 'fixture-extract';
   write(join(root, 'book.json'), book); write(control, mode);
-  const calls = (): { stage: string; pid: number }[] => existsSync(`${control}.calls`) ? read(`${control}.calls`).trim().split('\n').filter(Boolean).map(s => JSON.parse(s)) : [];
+  const calls = (): { stage: string; pid: number; model: string }[] => existsSync(`${control}.calls`) ? read(`${control}.calls`).trim().split('\n').filter(Boolean).map(s => JSON.parse(s)) : [];
   const args = ['chapter', root, '--number', '1'];
   const run = async (commandArgs = args, expected = 0) => {
     const result = await start(commandArgs).done;
@@ -44,18 +45,30 @@ function setup(t: TestContext, mode: Record<string, unknown> = {}) {
   return { root, dir, control, book, calls, args, run };
 }
 
-test('chapter, acceptance and revision preserve accepted text; changed source creates a fresh version', async t => {
-  const f = setup(t, { forbid: ['FUTURE_SECRET'], remainingIssue: true });
+test('preparation removes only selected clutter; acceptance and revision preserve texts; changed source creates a fresh version', async t => {
+  const ad = '订阅本站，领取优惠。', ambiguous = '作者的话：明天见。';
+  const f = setup(t, { forbid: ['FUTURE_SECRET'], remainingIssue: true, remove: ad, uncertain: ambiguous });
+  const sourcePath = join(f.root, 'sources', '0001.txt');
+  const raw = read(sourcePath).replace('桌上', `${ad}桌上`) + `\n\n${ambiguous}\n`;
+  writeFileSync(sourcePath, raw);
   write(join(f.root, 'context', 'notes.json'), { schemaVersion: 1, version: '1', entries: [
     { id: 'later', kind: 'plot_fact', text: 'FUTURE_SECRET', fromChapter: 2, toChapter: null, character: null, match: [] },
   ] });
+  const prepared = await f.run(['prepare', f.root, '--number', '1']);
+  assert.equal(prepared.state, 'prepared'); assert.equal(read(sourcePath), raw);
+  assert.ok(!read(prepared.cleanedSource).includes(ad)); assert.ok(read(prepared.cleanedSource).includes(ambiguous));
+  assert.equal(json(prepared.cleanup).parts[0].removals[0].quote, ad);
+  assert.equal(json(prepared.extraction).accepted, false); assert.deepEqual(json(join(f.root, 'context', 'glossary.json')).entries, []);
+  assert.deepEqual(f.calls().map(c => c.model), ['fixture-clean', 'fixture-extract']);
   const first = await f.run(), original = read(first.translation);
+  assert.equal(first.version, prepared.version); assert.ok(!original.includes(ad));
   assert.equal(first.remainingIssues, 1);
   await f.run(['accept', f.root, '--number', '1', '--version', first.version]);
   const acceptedPath = join(f.root, 'chapters', '0001', 'accepted.json'), before = read(acceptedPath);
   const feedback = join(f.dir, 'feedback.md'); writeFileSync(feedback, 'Уточнить интонацию.');
   const revision = await f.run(['revise', f.root, '--number', '1', '--notes', feedback]);
   assert.notEqual(revision.version, first.version); assert.notEqual(read(revision.translation), original);
+  assert.equal(f.calls().filter(c => c.stage === 'clean').length, 1); assert.equal(f.calls().filter(c => c.stage === 'extract').length, 1);
   assert.equal(read(acceptedPath), before); assert.equal(read(first.translation), original);
   await f.run(['accept', f.root, '--number', '1', '--version', revision.version]);
   writeFileSync(join(f.root, 'sources', '0001.txt'), '桌上有四本书。');
@@ -75,7 +88,7 @@ test('failure resumes after the saved draft; a completed rerun makes no backend 
 });
 
 test('truncated backend JSON and missing source coverage cannot complete a stage or leak stderr', async t => {
-  for (const mode of ['invalid_envelope', 'missing_segment']) {
+  for (const mode of ['invalid_envelope', 'missing_segment', 'invalid_cleanup']) {
     const f = setup(t, { mode });
     const error = await f.run(f.args, 1);
     assert.match(error, /invalid_backend_response|invalid_model_output/); assert.ok(!error.includes('PRIVATE_PROVIDER_SECRET'));
@@ -86,9 +99,10 @@ test('truncated backend JSON and missing source coverage cannot complete a stage
 });
 
 test('budget exhaustion stops immediately despite retries, keeps progress, and leaves unknown usage unknown', async t => {
-  const f = setup(t, { mode: 'budget', stage: 'review', omitUsage: true });
+  const f = setup(t, { mode: 'budget', stage: 'extract', omitUsage: true });
   f.book.settings.retries = 2; write(join(f.root, 'book.json'), f.book);
-  assert.match(await f.run(f.args, 3), /budget_exceeded/); assert.equal(f.calls().length, 2);
+  assert.match(await f.run(f.args, 3), /budget_exceeded/);
+  assert.equal(f.calls().filter(c => c.stage === 'extract').length, 1); assert.ok(!f.calls().some(c => c.stage === 'draft'));
   write(f.control, { omitUsage: true }); const result = await f.run();
   assert.equal(result.version, 'v0001'); assert.equal(f.calls().filter(c => c.stage === 'draft').length, 1);
   assert.equal(result.usage.inputTokens.knownTotal, null); assert.equal(result.usage.inputTokens.unknownCalls, f.calls().length);
@@ -98,8 +112,8 @@ test('conflicting writer is refused; killing the writer releases its lock and al
   const f = setup(t, { mode: 'wait', stage: 'review' }), first = start(f.args);
   let waitingPid: number | undefined;
   t.after(() => { first.process.kill('SIGKILL'); if (waitingPid) { try { process.kill(waitingPid, 'SIGKILL'); } catch { /* exited */ } } });
-  for (let i = 0; i < 300 && f.calls().length < 2; i++) await sleep(20);
-  assert.equal(f.calls().length, 2); waitingPid = f.calls()[1].pid;
+  for (let i = 0; i < 300 && !f.calls().some(c => c.stage === 'review'); i++) await sleep(20);
+  waitingPid = f.calls().find(c => c.stage === 'review')?.pid; assert.ok(waitingPid);
   assert.match(await f.run(f.args, 4), /project_locked/);
   first.process.kill('SIGKILL'); await first.done;
   process.kill(waitingPid, 'SIGKILL'); waitingPid = undefined;

@@ -1,7 +1,9 @@
-import { ensure, filled, object } from './core.ts';
+import { ensure, filled, integer, object } from './core.ts';
 
 export const STAGES = ['draft', 'review', 'edit', 'verify'] as const;
-export type Stage = typeof STAGES[number];
+export const PREPARATION_STAGES = ['clean', 'extract'] as const;
+export const ALL_STAGES = [...PREPARATION_STAGES, ...STAGES] as const;
+export type Stage = typeof ALL_STAGES[number];
 export type Unit = { id: string; text: string };
 export type Proposal = { source: string; target: string; rationale: string };
 export const NOTE_KINDS = ['source_issue', 'question', 'interpretation', 'plot_fact', 'character_belief', 'character_knowledge'] as const;
@@ -12,7 +14,11 @@ export type Issue = { unitId: string; category: typeof CATEGORIES[number]; sever
 type Extras = { glossaryProposals: Proposal[]; notes: Note[] };
 export type Translation = Extras & { segments: Unit[] };
 export type Review = Extras & { checkedUnitIds: string[]; issues: Issue[] };
-export type Output = Translation | Review;
+export type Extraction = Extras & { checkedUnitIds: string[] };
+export type Removal = { unitId: string; quote: string; occurrence: number; reason: string };
+export type Cleaning = { checkedUnitIds: string[]; removals: Removal[];
+  uncertain: { unitId: string; quote: string; reason: string }[] };
+export type Output = Translation | Review | Extraction | Cleaning;
 
 const str = { type: 'string' };
 const arr = (items: object) => ({ type: 'array', items });
@@ -25,6 +31,10 @@ const extras = {
 };
 
 export function schemaFor(stage: Stage): object {
+  if (stage === 'clean') return shape({ checkedUnitIds: arr(str), removals: arr(shape({
+    unitId: str, quote: str, occurrence: { type: 'integer', minimum: 1 }, reason: str,
+  })), uncertain: arr(shape({ unitId: str, quote: str, reason: str })) });
+  if (stage === 'extract') return shape({ checkedUnitIds: arr(str), ...extras });
   return stage === 'draft' || stage === 'edit' ? shape({ segments: arr(shape({ id: str, text: str })), ...extras })
     : shape({ checkedUnitIds: arr(str), issues: arr(shape({ unitId: str, category: { type: 'string', enum: [...CATEGORIES] },
       severity: { type: 'string', enum: ['error', 'warning', 'question'] }, sourceQuote: str, translationQuote: str,
@@ -40,16 +50,34 @@ export function validateOutput(value: unknown, stage: Stage, units: Unit[]): Out
   check(object(value));
   const v = value as Record<string, unknown>;
   const translation = stage === 'draft' || stage === 'edit';
-  keys(v, [...(translation ? ['segments'] : ['checkedUnitIds', 'issues']), 'glossaryProposals', 'notes']);
+  if (!translation) check(Array.isArray(v.checkedUnitIds) && v.checkedUnitIds.length === units.length
+    && v.checkedUnitIds.every((id, i) => id === units[i].id));
+  if (stage === 'clean') {
+    keys(v, ['checkedUnitIds', 'removals', 'uncertain']);
+    check(Array.isArray(v.removals) && Array.isArray(v.uncertain));
+    for (const [field, items] of [['removals', v.removals], ['uncertain', v.uncertain]] as const) {
+      for (const item of items as unknown[]) {
+        check(object(item)); const r = item as Record<string, unknown>;
+        keys(r, field === 'removals' ? ['unitId', 'quote', 'occurrence', 'reason'] : ['unitId', 'quote', 'reason']);
+        check(filled(r.quote) && filled(r.reason) && units.some(u => u.id === r.unitId && u.text.includes(r.quote as string)));
+        if (field === 'removals') check(integer(r.occurrence, 1));
+      }
+    }
+    applyCleaning(units, v as unknown as Cleaning); // Also rejects missing occurrences and overlapping deletions.
+    return v as unknown as Cleaning;
+  }
+  keys(v, [...(translation ? ['segments'] : stage === 'extract' ? ['checkedUnitIds'] : ['checkedUnitIds', 'issues']), 'glossaryProposals', 'notes']);
   check(Array.isArray(v.glossaryProposals) && Array.isArray(v.notes));
   for (const proposal of v.glossaryProposals as unknown[]) {
     check(object(proposal)); const p = proposal as Record<string, unknown>;
     keys(p, ['source', 'target', 'rationale']); check(filled(p.source) && filled(p.target) && filled(p.rationale));
+    if (stage === 'extract') check(units.some(u => u.text.includes(p.source as string)));
   }
   for (const note of v.notes as unknown[]) {
     check(object(note)); const n = note as Record<string, unknown>;
     keys(n, ['kind', 'text', 'character', 'evidence']);
     check(NOTE_KINDS.includes(n.kind as Note['kind']) && filled(n.text) && (n.character === null || filled(n.character)) && typeof n.evidence === 'string');
+    if (stage === 'extract') check(filled(n.evidence) && units.some(u => u.text.includes(n.evidence as string)));
   }
   if (translation) {
     check(Array.isArray(v.segments) && v.segments.length === units.length);
@@ -57,9 +85,8 @@ export function validateOutput(value: unknown, stage: Stage, units: Unit[]): Out
       check(object(segment)); const s = segment as Record<string, unknown>;
       keys(s, ['id', 'text']); check(s.id === units[i].id && filled(s.text));
     });
-  } else {
-    check(Array.isArray(v.checkedUnitIds) && v.checkedUnitIds.length === units.length
-      && v.checkedUnitIds.every((id, i) => id === units[i].id) && Array.isArray(v.issues));
+  } else if (stage !== 'extract') {
+    check(Array.isArray(v.issues));
     for (const issue of v.issues as unknown[]) {
       check(object(issue)); const i = issue as Record<string, unknown>;
       keys(i, ['unitId', 'category', 'severity', 'sourceQuote', 'translationQuote', 'description', 'suggestion']);
@@ -69,6 +96,33 @@ export function validateOutput(value: unknown, stage: Stage, units: Unit[]): Out
     }
   }
   return v as unknown as Output;
+}
+
+// Models select exact spans; only this code changes the text. Raw units remain in the checkpoint.
+export function applyCleaning(units: Unit[], output: Cleaning): Unit[] {
+  return units.flatMap(unit => {
+    const spans = output.removals.filter(r => r.unitId === unit.id).map(r => {
+      let start = -r.quote.length;
+      for (let n = 0; n < r.occurrence; n++) {
+        start = unit.text.indexOf(r.quote, start + r.quote.length);
+        ensure(start >= 0, 'Cleanup quote occurrence does not exist.', 'invalid_model_output');
+      }
+      return { start, end: start + r.quote.length };
+    }).sort((a, b) => a.start - b.start);
+    for (const note of output.uncertain.filter(n => n.unitId === unit.id)) {
+      for (let at = unit.text.indexOf(note.quote); at >= 0; at = unit.text.indexOf(note.quote, at + note.quote.length)) {
+        ensure(!spans.some(s => s.start < at + note.quote.length && s.end > at),
+          'Cleanup cannot delete a fragment marked uncertain.', 'invalid_model_output');
+      }
+    }
+    let end = 0, text = '';
+    for (const span of spans) {
+      ensure(span.start >= end, 'Cleanup deletions overlap.', 'invalid_model_output');
+      text += unit.text.slice(end, span.start); end = span.end;
+    }
+    text += unit.text.slice(end);
+    return text.trim() ? [{ id: unit.id, text: text.trim() }] : [];
+  });
 }
 
 export function sourceUnits(text: string): Unit[] {

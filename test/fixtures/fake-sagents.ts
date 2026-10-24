@@ -33,8 +33,17 @@ else {
   const segments = data.sourceUnits.map((unit: { id: string; text: string }) => ({ id: unit.id,
     text: `${data.userFeedback ? 'Редакция: ' : ''}${dictionary[unit.text] ?? `Перевод: ${unit.text}`}` }));
   if (control.mode === 'missing_segment') segments.pop();
-  const extras = { glossaryProposals: [{ source: '小林', target: 'Сяолинь', rationale: 'Synthetic fixture proposal.' }], notes: [] };
-  const output = translation ? { segments, ...extras } : { checkedUnitIds: data.sourceUnits.map((u: { id: string }) => u.id),
+  const extras = { glossaryProposals: data.sourceUnits.some((u: { text: string }) => u.text.includes('小林'))
+    ? [{ source: '小林', target: 'Сяолинь', rationale: 'Synthetic fixture proposal.' }] : [], notes: [] };
+  const checkedUnitIds = data.sourceUnits.map((u: { id: string }) => u.id);
+  if (control.mode === 'missing_segment') checkedUnitIds.pop();
+  const removals = data.sourceUnits.filter((u: { text: string }) => control.remove && u.text.includes(control.remove))
+    .map((u: { id: string }) => ({ unitId: u.id, quote: control.remove, occurrence: 1, reason: 'Synthetic site advertisement.' }));
+  if (control.mode === 'invalid_cleanup') removals.push({ unitId: checkedUnitIds[0], quote: 'NOT IN SOURCE', occurrence: 1, reason: 'Invalid fixture removal.' });
+  const uncertain = data.sourceUnits.filter((u: { text: string }) => control.uncertain && u.text.includes(control.uncertain))
+    .map((u: { id: string }) => ({ unitId: u.id, quote: control.uncertain, reason: 'Synthetic ambiguity; keep this text.' }));
+  const output = data.stage === 'clean' ? { checkedUnitIds, removals, uncertain }
+    : data.stage === 'extract' ? { checkedUnitIds, ...extras } : translation ? { segments, ...extras } : { checkedUnitIds,
     issues: control.remainingIssue ? [{ unitId: data.sourceUnits[0].id, category: 'source_issue', severity: 'question',
       sourceQuote: '', translationQuote: '', description: 'Synthetic unresolved ambiguity.', suggestion: '' }] : [], ...extras };
   const usage = control.omitUsage ? {} : { usage: { inputTokens: 10, cachedInputTokens: 0, outputTokens: 5, reasoningTokens: null } };
